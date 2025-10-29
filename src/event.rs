@@ -127,16 +127,17 @@ pub(crate) mod stream;
 pub(crate) mod sys;
 pub(crate) mod timeout;
 
+pub(crate) use internal::InternalEvent;
+#[cfg(unix)]
+pub(crate) use internal::OscColorPayload;
+pub(crate) use internal::{poll as poll_internal, read as read_internal};
+
 #[cfg(feature = "derive-more")]
 use derive_more::derive::IsVariant;
 #[cfg(feature = "event-stream")]
 pub use stream::EventStream;
 
-use crate::{
-    csi,
-    event::{filter::EventFilter, internal::InternalEvent},
-    Command,
-};
+use crate::{csi, event::filter::EventFilter, Command};
 use std::fmt::{self, Display};
 use std::time::Duration;
 

@@ -46,6 +46,22 @@ impl Filter for PrimaryDeviceAttributesFilter {
     }
 }
 
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+pub(crate) struct OscColorFilter {
+    pub(crate) slot: u8,
+}
+
+#[cfg(unix)]
+impl Filter for OscColorFilter {
+    fn eval(&self, event: &InternalEvent) -> bool {
+        matches!(
+            *event,
+            InternalEvent::OscColor { slot, .. } if slot == self.slot
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct EventFilter;
 
@@ -65,12 +81,15 @@ impl Filter for EventFilter {
 #[cfg(unix)]
 mod tests {
     use super::{
-        super::Event, CursorPositionFilter, EventFilter, Filter, InternalEvent,
-        KeyboardEnhancementFlagsFilter, PrimaryDeviceAttributesFilter,
+        super::Event, CursorPositionFilter, EventFilter, Filter, KeyboardEnhancementFlagsFilter,
+        OscColorFilter, PrimaryDeviceAttributesFilter,
     };
+    use crate::event::internal::InternalEvent;
+    use crate::event::OscColorPayload;
+    use InternalEvent::OscColor;
 
     #[derive(Debug, Clone)]
-    pub(crate) struct InternalEventFilter;
+    struct InternalEventFilter;
 
     impl Filter for InternalEventFilter {
         fn eval(&self, _: &InternalEvent) -> bool {
@@ -99,6 +118,17 @@ mod tests {
     fn test_primary_device_attributes_filter_filters_primary_device_attributes() {
         assert!(!PrimaryDeviceAttributesFilter.eval(&InternalEvent::Event(Event::Resize(10, 10))));
         assert!(PrimaryDeviceAttributesFilter.eval(&InternalEvent::PrimaryDeviceAttributes));
+    }
+
+    #[test]
+    fn test_osc_color_filter_matches_slot() {
+        let payload = OscColorPayload::Rgb { r: 1, g: 2, b: 3 };
+        let filter = OscColorFilter { slot: 10 };
+        assert!(filter.eval(&OscColor {
+            slot: 10,
+            payload: payload.clone()
+        }));
+        assert!(!filter.eval(&OscColor { slot: 11, payload }));
     }
 
     #[test]
