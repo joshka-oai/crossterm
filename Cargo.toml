@@ -127,4 +127,4 @@ required-features = ["osc52"]
 
 [[example]]
 name = "mouse-scroll"
-required-features = ["events"]
+required-features = ["event-stream", "events"]

@@ -4,7 +4,7 @@
 
 - Track and surface scroll burst timing to compare terminal behavior.
 - Render at most 60fps, only when needed (events or active burst).
-- Drain events aggressively without exceeding the frame budget.
+- Process events as they arrive and keep rendering decoupled from timing calculations.
 - Show rich per-event and per-burst timing details in the debug pane.
 - Support auto vs manual burst timeout with live feedback.
 

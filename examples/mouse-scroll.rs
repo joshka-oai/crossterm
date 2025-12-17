@@ -5,8 +5,9 @@
 //! current scroll position in a fixed status bar. The intent is diagnostic rather
 //! than polished UI, so the behavior stays close to the raw event stream.
 //!
-//! Keys: `q`/`Esc` quits, `1`/`3` change scroll step, `d` toggles the debug pane,
-//! `r` resets counters and calibration, arrows scroll line-by-line.
+//! Keys: `q`/`Esc` quits, `1`/`3` change scroll step, `a` toggles auto/manual timeout,
+//! `[`/`]` adjust manual timeout, `t` toggles content (lipsum/design), `d` toggles the
+//! debug pane, `r` resets counters and calibration, arrows scroll line-by-line.
 //!
 //! cargo run --example mouse-scroll
 
@@ -15,9 +16,10 @@ use std::collections::VecDeque;
 use std::io;
 use std::time::{Duration, Instant};
 
+use futures::StreamExt;
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyModifiers,
     MouseEvent, MouseEventKind,
 };
 use crossterm::style::{Attribute, Color, Print, SetAttribute, SetForegroundColor};
@@ -27,29 +29,48 @@ use crossterm::terminal::{
 };
 use crossterm::{execute, queue, SynchronizedUpdate};
 use textwrap::wrap;
+use tokio::time::{interval, MissedTickBehavior};
 
 const LIPSUM: &str = include_str!("mouse-scroll-lipsum.txt");
+const DESIGN_DOC: &str = include_str!("mouse-scroll-plan.md");
 const CONTENT_MIN_WIDTH: usize = 20;
 const LOG_MIN_WIDTH: usize = 24;
 const LOG_MAX_WIDTH: usize = 40;
 const LOG_GAP: usize = 1;
 const MAX_LOG_EVENTS: usize = 200;
-const WHEEL_BURST_TIMEOUT: Duration = Duration::from_millis(120);
-const HELP_LINES: [&str; 5] = [
+const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+const DEFAULT_BURST_TIMEOUT: Duration = Duration::from_millis(120);
+const TIMEOUT_STEP: Duration = Duration::from_millis(10);
+const GAP_SAMPLE_LIMIT: usize = 80;
+const HELP_LINES: [&str; 8] = [
     "Keys:",
     "  q/Esc  quit",
     "  1/3    step",
+    "  a      auto timeout",
+    "  [/]    timeout -/+",
+    "  t      content",
     "  d      debug",
     "  r      reset",
 ];
+const EXPLAIN_LINES: [&str; 5] = [
+    "Stats:",
+    "  Δt = gap from previous event",
+    "  t  = time since burst start",
+    "  Active/Last = current/closed burst",
+    "  Burst = summary line when closed",
+];
 
-fn main() -> io::Result<()> {
+#[tokio::main]
+async fn main() -> io::Result<()> {
     enable_raw_mode()?;
 
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture, Hide)?;
 
-    let result = App::new(LIPSUM).and_then(|mut app| app.run(&mut stdout));
+    let result = match App::new(LIPSUM) {
+        Ok(mut app) => app.run(&mut stdout).await,
+        Err(error) => Err(error),
+    };
 
     execute!(stdout, Show, DisableMouseCapture, LeaveAlternateScreen)?;
     disable_raw_mode()?;
@@ -70,12 +91,17 @@ struct App {
     scroll_step: ScrollStep,
     mouse_log: VecDeque<LogEntry>,
     show_debug: bool,
-    wheel_last_event: Option<Instant>,
-    wheel_current_burst: u32,
-    wheel_last_burst: u32,
-    wheel_burst_samples: u32,
-    wheel_events_total: u32,
-    wheel_burst_color: Color,
+    content_source: ContentSource,
+    burst: Option<BurstState>,
+    last_burst: Option<BurstSummary>,
+    last_burst_end: Option<Instant>,
+    last_burst_gap: Option<Duration>,
+    burst_samples: u32,
+    burst_events_total: u32,
+    gap_samples: VecDeque<Duration>,
+    timeout_mode: TimeoutMode,
+    manual_timeout: Duration,
+    next_burst_color: Color,
     width: u16,
     height: u16,
 }
@@ -97,10 +123,46 @@ enum ScrollStep {
     Three,
 }
 
+#[derive(Copy, Clone, Debug)]
+enum ContentSource {
+    Lipsum,
+    DesignDoc,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum ScrollDirection {
+    Up,
+    Down,
+}
+
 #[derive(Clone, Debug)]
 struct LogEntry {
     text: String,
     color: Option<Color>,
+}
+
+#[derive(Clone, Debug)]
+struct BurstState {
+    start: Instant,
+    last: Instant,
+    count: u32,
+    direction: ScrollDirection,
+    sum_delta: Duration,
+    color: Color,
+}
+
+#[derive(Clone, Debug)]
+struct BurstSummary {
+    direction: ScrollDirection,
+    count: u32,
+    duration: Duration,
+    avg_delta: Option<Duration>,
+}
+
+#[derive(Copy, Clone, Debug)]
+enum TimeoutMode {
+    Auto,
+    Manual,
 }
 
 impl App {
@@ -123,12 +185,17 @@ impl App {
             scroll_step: ScrollStep::One,
             mouse_log,
             show_debug: true,
-            wheel_last_event: None,
-            wheel_current_burst: 0,
-            wheel_last_burst: 0,
-            wheel_burst_samples: 0,
-            wheel_events_total: 0,
-            wheel_burst_color: Color::Blue,
+            content_source: ContentSource::Lipsum,
+            burst: None,
+            last_burst: None,
+            last_burst_end: None,
+            last_burst_gap: None,
+            burst_samples: 0,
+            burst_events_total: 0,
+            gap_samples: VecDeque::with_capacity(GAP_SAMPLE_LIMIT),
+            timeout_mode: TimeoutMode::Auto,
+            manual_timeout: DEFAULT_BURST_TIMEOUT,
+            next_burst_color: Color::Blue,
             width,
             height,
         })
@@ -136,20 +203,45 @@ impl App {
 
     /// Drive the main event loop until a quit action occurs.
     ///
-    /// This method renders on each iteration and blocks for input events. It exits on
-    /// `q`, `Esc`, or `Ctrl+C`, and otherwise mutates internal state based on input.
-    fn run(&mut self, stdout: &mut io::Stdout) -> io::Result<()> {
-        loop {
-            self.render(stdout)?;
-            let action = match event::read()? {
-                Event::Key(key) => self.handle_key(key),
-                Event::Mouse(mouse) => self.handle_mouse(mouse),
-                Event::Resize(width, height) => self.handle_resize(width, height),
-                _ => self.handle_other(),
-            };
+    /// This runs a 60fps tick for rendering and listens for terminal events via
+    /// `EventStream`. Rendering happens only when needed or while a burst is active.
+    async fn run(&mut self, stdout: &mut io::Stdout) -> io::Result<()> {
+        let mut events = EventStream::new();
+        let mut ticker = interval(FRAME_INTERVAL);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut render_needed = true;
 
-            if matches!(action, AppAction::Quit) {
-                return Ok(());
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let burst_active = self.update_burst_timeout();
+                    if burst_active {
+                        render_needed = true;
+                    }
+                    if render_needed {
+                        self.render(stdout)?;
+                        render_needed = false;
+                    }
+                }
+                maybe_event = events.next() => {
+                    let event = match maybe_event {
+                        Some(Ok(event)) => event,
+                        Some(Err(error)) => return Err(error),
+                        None => return Ok(()),
+                    };
+                    let action = match event {
+                        Event::Key(key) => self.handle_key(key),
+                        Event::Mouse(mouse) => self.handle_mouse(mouse),
+                        Event::Resize(width, height) => self.handle_resize(width, height),
+                        _ => self.handle_other(),
+                    };
+
+                    if matches!(action, AppAction::Quit) {
+                        return Ok(());
+                    }
+
+                    render_needed = true;
+                }
             }
         }
     }
@@ -157,8 +249,9 @@ impl App {
     /// Handle a keyboard event and report whether the app should exit.
     ///
     /// Arrow keys scroll line-by-line, while `q`, `Esc`, and `Ctrl+C` terminate the loop.
-    /// Use `1` or `3` to change the scroll step, `d` to toggle the debug pane, and `r`
-    /// to reset scroll counters plus calibration state.
+    /// Use `1` or `3` to change the scroll step, `a` to toggle auto/manual timeout,
+    /// `[`/`]` to adjust the manual timeout, `t` to toggle the content source, `d` to
+    /// toggle the debug pane, and `r` to reset scroll counters plus calibration state.
     fn handle_key(&mut self, key: KeyEvent) -> AppAction {
         match key.code {
             KeyCode::Esc => return AppAction::Quit,
@@ -174,6 +267,10 @@ impl App {
             KeyCode::Down => self.scroll_down(),
             KeyCode::Char('1') => self.set_scroll_step(ScrollStep::One),
             KeyCode::Char('3') => self.set_scroll_step(ScrollStep::Three),
+            KeyCode::Char('a') => self.toggle_timeout_mode(),
+            KeyCode::Char('[') => self.adjust_manual_timeout(false),
+            KeyCode::Char(']') => self.adjust_manual_timeout(true),
+            KeyCode::Char('t') => self.toggle_content_source(),
             KeyCode::Char('d') => self.toggle_debug(),
             KeyCode::Char('r') => self.reset_stats(),
             _ => {}
@@ -189,21 +286,68 @@ impl App {
     fn handle_mouse(&mut self, mouse: MouseEvent) -> AppAction {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
-                self.record_scroll_event();
-                self.record_mouse_event(&mouse, true);
+                self.handle_scroll_event(ScrollDirection::Up, &mouse);
                 self.scroll_up_events += 1;
                 self.scroll_up();
             }
             MouseEventKind::ScrollDown => {
-                self.record_scroll_event();
-                self.record_mouse_event(&mouse, true);
+                self.handle_scroll_event(ScrollDirection::Down, &mouse);
                 self.scroll_down_events += 1;
                 self.scroll_down();
             }
-            _ => self.record_mouse_event(&mouse, false),
+            _ => self.log_mouse_event(&mouse),
         }
 
         AppAction::Continue
+    }
+
+    /// Handle a scroll event and update burst timing state.
+    ///
+    /// A new burst starts on the first event or when direction changes, and an existing
+    /// burst closes if the inter-event gap exceeds the current timeout.
+    fn handle_scroll_event(&mut self, direction: ScrollDirection, mouse: &MouseEvent) {
+        let now = Instant::now();
+        let timeout = self.effective_timeout();
+        let mut start_new = false;
+
+        if let Some(burst) = &self.burst {
+            let gap = now.duration_since(burst.last);
+            if gap > timeout || burst.direction != direction {
+                self.finalize_burst();
+                start_new = true;
+            }
+        } else {
+            start_new = true;
+        }
+
+        if start_new {
+            self.start_burst(direction, now);
+        }
+
+        if let Some(burst) = &mut self.burst {
+            let (delta, elapsed, color, should_record_gap) = {
+                let should_record_gap = burst.count > 0;
+                let delta = if should_record_gap {
+                    now.duration_since(burst.last)
+                } else {
+                    Duration::from_millis(0)
+                };
+                if should_record_gap {
+                    burst.sum_delta = burst.sum_delta.saturating_add(delta);
+                }
+                burst.last = now;
+                burst.count = burst.count.saturating_add(1);
+
+                let elapsed = now.duration_since(burst.start);
+                let color = burst.color;
+                (delta, elapsed, color, should_record_gap)
+            };
+
+            if should_record_gap {
+                self.record_gap_sample(delta);
+            }
+            self.log_scroll_event(direction, mouse, delta, elapsed, color);
+        }
     }
 
     /// Handle a terminal resize event.
@@ -264,9 +408,42 @@ impl App {
         self.scroll_step = step;
     }
 
+    /// Toggle between auto and manual burst timeout modes.
+    fn toggle_timeout_mode(&mut self) {
+        self.timeout_mode = match self.timeout_mode {
+            TimeoutMode::Auto => TimeoutMode::Manual,
+            TimeoutMode::Manual => TimeoutMode::Auto,
+        };
+    }
+
+    /// Adjust the manual timeout up or down by a fixed step.
+    fn adjust_manual_timeout(&mut self, increase: bool) {
+        let current_ms = self.manual_timeout.as_millis();
+        let step_ms = TIMEOUT_STEP.as_millis();
+        let next_ms = if increase {
+            current_ms.saturating_add(step_ms)
+        } else {
+            current_ms.saturating_sub(step_ms)
+        };
+        self.manual_timeout = Duration::from_millis(next_ms as u64);
+    }
+
     /// Toggle whether the debug pane is shown and rewrap content to the new width.
     fn toggle_debug(&mut self) {
         self.show_debug = !self.show_debug;
+        self.rewrap();
+    }
+
+    /// Toggle between lipsum content and the design doc.
+    fn toggle_content_source(&mut self) {
+        self.content_source = match self.content_source {
+            ContentSource::Lipsum => ContentSource::DesignDoc,
+            ContentSource::DesignDoc => ContentSource::Lipsum,
+        };
+        self.text = match self.content_source {
+            ContentSource::Lipsum => LIPSUM,
+            ContentSource::DesignDoc => DESIGN_DOC,
+        };
         self.rewrap();
     }
 
@@ -275,7 +452,19 @@ impl App {
         self.scroll_up_events = 0;
         self.scroll_down_events = 0;
         self.mouse_log.clear();
-        self.reset_calibration();
+        self.reset_burst_state();
+    }
+
+    /// Reset burst timing and calibration state.
+    fn reset_burst_state(&mut self) {
+        self.burst = None;
+        self.last_burst = None;
+        self.last_burst_end = None;
+        self.last_burst_gap = None;
+        self.burst_samples = 0;
+        self.burst_events_total = 0;
+        self.gap_samples.clear();
+        self.next_burst_color = Color::Blue;
     }
 
     /// Rewrap the text to the active content width.
@@ -366,8 +555,9 @@ impl App {
             row += 1;
         }
 
+        let now = Instant::now();
         for line in self
-            .debug_lines()
+            .debug_lines(now)
             .into_iter()
             .take(view_height.saturating_sub(row))
         {
@@ -388,7 +578,8 @@ impl App {
             row += 1;
         }
 
-        let log_rows = view_height.saturating_sub(row);
+        let explain_rows = EXPLAIN_LINES.len().min(view_height.saturating_sub(row));
+        let log_rows = view_height.saturating_sub(row + explain_rows);
         for (offset, entry) in self.mouse_log.iter().take(log_rows).enumerate() {
             let mut line = entry.text.clone();
             line.truncate(layout.log_width);
@@ -403,99 +594,219 @@ impl App {
             queue!(stdout, Print(line), SetAttribute(Attribute::Reset))?;
         }
 
+        let explain_start = row + log_rows;
+        for (offset, line) in EXPLAIN_LINES.iter().take(explain_rows).enumerate() {
+            let mut text = line.to_string();
+            text.truncate(layout.log_width);
+            queue!(
+                stdout,
+                MoveTo(log_x, (explain_start + offset) as u16),
+                Print(text)
+            )?;
+        }
+
         Ok(())
     }
 
-    /// Build the debug pane header lines, including calibration hints.
+    /// Build the debug pane header lines, including burst timing details.
     ///
     /// The header is split across multiple lines to keep the log pane readable.
-    fn debug_lines(&self) -> Vec<String> {
-        let last_burst = if self.wheel_last_burst == 0 {
-            "--".to_string()
+    fn debug_lines(&self, now: Instant) -> Vec<String> {
+        let mut lines = Vec::new();
+        lines.push(format!("Mouse events ({})", self.mouse_log.len()));
+        if let Some(burst) = &self.burst {
+            let elapsed = now.duration_since(burst.start);
+            let avg_delta = average_duration(burst.sum_delta, burst.count.saturating_sub(1));
+            lines.push(format!(
+                "Active {} {} ev {} avgΔ {}",
+                direction_label(burst.direction),
+                burst.count,
+                fmt_duration(elapsed),
+                fmt_duration_opt(avg_delta)
+            ));
         } else {
-            self.wheel_last_burst.to_string()
-        };
-        vec![
-            format!("Mouse events ({})", self.mouse_log.len()),
-            format!("Cal {}", self.calibration_label()),
-            format!("Last {}", last_burst),
-        ]
+            lines.push("Active --".to_string());
+        }
+
+        if let Some(last) = &self.last_burst {
+            lines.push(format!(
+                "Last {} {} ev {} avgΔ {}",
+                direction_label(last.direction),
+                last.count,
+                fmt_duration(last.duration),
+                fmt_duration_opt(last.avg_delta)
+            ));
+        } else {
+            lines.push("Last --".to_string());
+        }
+
+        if let Some(gap) = self.last_burst_gap {
+            lines.push(format!("Gap {}", fmt_duration(gap)));
+        } else {
+            lines.push("Gap --".to_string());
+        }
+
+        lines.push(format!("Cal {}", self.calibration_label()));
+        lines.push(format!("Source {}", self.content_source_label()));
+        lines.extend(self.timeout_lines());
+        lines
     }
 
-    /// Record a mouse event in the log, keeping only the most recent entries.
-    ///
-    /// The stored strings are intentionally compact to maximize the visible history.
-    fn record_mouse_event(&mut self, mouse: &MouseEvent, is_scroll: bool) {
+    /// Record a non-scroll mouse event in the log.
+    fn log_mouse_event(&mut self, mouse: &MouseEvent) {
         if matches!(mouse.kind, MouseEventKind::Moved) {
             return;
         }
-        let entry = LogEntry {
-            text: format!(
-                "{:?} ({}, {}) {:?}",
-                mouse.kind, mouse.column, mouse.row, mouse.modifiers
-            ),
-            color: if is_scroll {
-                Some(self.wheel_burst_color)
-            } else {
-                None
-            },
+        let text = format!(
+            "{:?} ({}, {}) {:?}",
+            mouse.kind, mouse.column, mouse.row, mouse.modifiers
+        );
+        self.push_log(text, None);
+    }
+
+    /// Record a scroll event log line with timing details.
+    fn log_scroll_event(
+        &mut self,
+        direction: ScrollDirection,
+        mouse: &MouseEvent,
+        delta: Duration,
+        elapsed: Duration,
+        color: Color,
+    ) {
+        let text = format!(
+            "{} Δ{} t={} ({}, {}) {:?}",
+            direction_label(direction),
+            fmt_duration(delta),
+            fmt_duration(elapsed),
+            mouse.column,
+            mouse.row,
+            mouse.modifiers
+        );
+        self.push_log(text, Some(color));
+    }
+
+    /// Update the active burst timeout and finalize it when it expires.
+    ///
+    /// Returns true when a burst is active or has just closed.
+    fn update_burst_timeout(&mut self) -> bool {
+        let now = Instant::now();
+        let should_finalize = match self.burst.as_ref() {
+            Some(burst) => now.duration_since(burst.last) > self.effective_timeout(),
+            None => return false,
         };
-        self.mouse_log.push_front(entry);
+
+        if should_finalize {
+            self.finalize_burst();
+        }
+
+        true
+    }
+
+    /// Start a new burst for the given direction.
+    fn start_burst(&mut self, direction: ScrollDirection, now: Instant) {
+        let color = self.next_burst_color();
+        self.last_burst_gap = self
+            .last_burst_end
+            .map(|end| now.saturating_duration_since(end));
+        self.burst = Some(BurstState {
+            start: now,
+            last: now,
+            count: 0,
+            direction,
+            sum_delta: Duration::from_millis(0),
+            color,
+        });
+    }
+
+    /// Finalize the active burst into summary statistics.
+    fn finalize_burst(&mut self) {
+        let Some(burst) = self.burst.take() else {
+            return;
+        };
+
+        let duration = burst.last.duration_since(burst.start);
+        let avg_delta = average_duration(burst.sum_delta, burst.count.saturating_sub(1));
+        let summary = BurstSummary {
+            direction: burst.direction,
+            count: burst.count,
+            duration,
+            avg_delta,
+        };
+        self.last_burst = Some(summary.clone());
+        self.last_burst_end = Some(burst.last);
+        self.burst_samples = self.burst_samples.saturating_add(1);
+        self.burst_events_total = self.burst_events_total.saturating_add(burst.count);
+        self.log_burst_summary(&summary, burst.color);
+    }
+
+    /// Record a burst summary line in the log.
+    fn log_burst_summary(&mut self, summary: &BurstSummary, color: Color) {
+        let text = format!(
+            "Burst {} {} ev {} avgΔ {}",
+            direction_label(summary.direction),
+            summary.count,
+            fmt_duration(summary.duration),
+            fmt_duration_opt(summary.avg_delta)
+        );
+        self.push_log(text, Some(color));
+    }
+
+    /// Push a log entry and trim the log to the maximum size.
+    fn push_log(&mut self, text: String, color: Option<Color>) {
+        self.mouse_log.push_front(LogEntry { text, color });
         if self.mouse_log.len() > MAX_LOG_EVENTS {
             self.mouse_log.pop_back();
         }
     }
 
-    /// Record a scroll wheel event for calibration.
-    ///
-    /// Scroll events arriving close together are treated as a single wheel notch. When
-    /// the gap exceeds the timeout, the previous burst is finalized and used for the
-    /// moving average.
-    fn record_scroll_event(&mut self) {
-        let now = Instant::now();
-        if let Some(last_event) = self.wheel_last_event {
-            if now.duration_since(last_event) > WHEEL_BURST_TIMEOUT {
-                self.finalize_wheel_burst();
-            }
+    /// Compute the effective timeout in the active mode.
+    fn effective_timeout(&self) -> Duration {
+        match self.timeout_mode {
+            TimeoutMode::Manual => self.manual_timeout,
+            TimeoutMode::Auto => self
+                .auto_timeout_stats()
+                .map(|(_, _, timeout)| timeout)
+                .unwrap_or(self.manual_timeout),
         }
-
-        if self.wheel_current_burst == 0 {
-            self.start_wheel_burst();
-        }
-        self.wheel_current_burst = self.wheel_current_burst.saturating_add(1);
-        self.wheel_last_event = Some(now);
     }
 
-    /// Finalize the current scroll burst into the calibration counters.
-    fn finalize_wheel_burst(&mut self) {
-        if self.wheel_current_burst == 0 {
-            return;
+    /// Compute auto-timeout stats based on median + MAD.
+    fn auto_timeout_stats(&self) -> Option<(Duration, Duration, Duration)> {
+        if self.gap_samples.len() < 4 {
+            return None;
         }
 
-        self.wheel_last_burst = self.wheel_current_burst;
-        self.wheel_burst_samples = self.wheel_burst_samples.saturating_add(1);
-        self.wheel_events_total = self
-            .wheel_events_total
-            .saturating_add(self.wheel_current_burst);
-        self.wheel_current_burst = 0;
+        let mut gaps: Vec<u128> = self.gap_samples.iter().map(|gap| gap.as_micros()).collect();
+        let median_value = median(&mut gaps);
+        let mut deviations: Vec<u128> = gaps
+            .iter()
+            .map(|gap| gap.abs_diff(median_value))
+            .collect();
+        let mad = median(&mut deviations);
+        let min_us = 10_000;
+        let effective_us = median_value.saturating_add(mad.saturating_mul(3)).max(min_us);
+        let median = Duration::from_micros(median_value as u64);
+        let mad = Duration::from_micros(mad as u64);
+        let timeout = Duration::from_micros(effective_us as u64);
+        Some((median, mad, timeout))
     }
 
-    /// Reset all calibration counters and pending burst state.
-    fn reset_calibration(&mut self) {
-        self.wheel_last_event = None;
-        self.wheel_current_burst = 0;
-        self.wheel_last_burst = 0;
-        self.wheel_burst_samples = 0;
-        self.wheel_events_total = 0;
-        self.wheel_burst_color = Color::Blue;
+    /// Record an inter-event gap for auto-timeout estimation.
+    fn record_gap_sample(&mut self, gap: Duration) {
+        self.gap_samples.push_back(gap);
+        if self.gap_samples.len() > GAP_SAMPLE_LIMIT {
+            self.gap_samples.pop_front();
+        }
     }
 
-    /// Start a new wheel burst and toggle its visual marker.
-    fn start_wheel_burst(&mut self) {
-        self.wheel_burst_color = match self.wheel_burst_color {
+    /// Alternate the color used to mark burst log entries.
+    fn next_burst_color(&mut self) -> Color {
+        let current = self.next_burst_color;
+        self.next_burst_color = match current {
             Color::Blue => Color::Cyan,
             _ => Color::Blue,
         };
+        current
     }
 
     /// Build the status bar string for the bottom row.
@@ -540,19 +851,43 @@ impl App {
 
     /// Return a human-friendly calibration label.
     fn calibration_label(&self) -> String {
-        match self.calibrated_events_per_wheel() {
-            Some(value) => format!("{value:.1} ev/w"),
+        match self.calibrated_events_per_burst() {
+            Some(value) => format!("{value:.1} ev/b"),
             None => "--".to_string(),
         }
     }
 
-    /// Compute the average number of events per wheel notch.
-    fn calibrated_events_per_wheel(&self) -> Option<f64> {
-        if self.wheel_burst_samples == 0 {
+    /// Compute the average number of events per burst.
+    fn calibrated_events_per_burst(&self) -> Option<f64> {
+        if self.burst_samples == 0 {
             return None;
         }
 
-        Some(self.wheel_events_total as f64 / self.wheel_burst_samples as f64)
+        Some(self.burst_events_total as f64 / self.burst_samples as f64)
+    }
+
+    /// Build timeout lines describing the active mode.
+    fn timeout_lines(&self) -> Vec<String> {
+        match self.timeout_mode {
+            TimeoutMode::Manual => vec![
+                "Timeout manual".to_string(),
+                format!("  {}", fmt_duration(self.manual_timeout)),
+            ],
+            TimeoutMode::Auto => {
+                if let Some((median, mad, timeout)) = self.auto_timeout_stats() {
+                    vec![
+                        "Timeout auto".to_string(),
+                        format!("  {}", fmt_duration(timeout)),
+                        format!("  med {} mad {}", fmt_duration(median), fmt_duration(mad)),
+                    ]
+                } else {
+                    vec![
+                        "Timeout auto".to_string(),
+                        format!("  {} (no data)", fmt_duration(self.manual_timeout)),
+                    ]
+                }
+            }
+        }
     }
 
     /// Return the number of lines to move per scroll action.
@@ -568,6 +903,14 @@ impl App {
         match self.scroll_step {
             ScrollStep::One => "1",
             ScrollStep::Three => "3",
+        }
+    }
+
+    /// Return the user-facing label for the current content source.
+    fn content_source_label(&self) -> &'static str {
+        match self.content_source {
+            ContentSource::Lipsum => "lipsum",
+            ContentSource::DesignDoc => "design",
         }
     }
 
@@ -627,5 +970,41 @@ impl App {
     /// terminal height when possible.
     fn view_height(&self) -> usize {
         self.height.saturating_sub(1) as usize
+    }
+}
+
+fn direction_label(direction: ScrollDirection) -> &'static str {
+    match direction {
+        ScrollDirection::Up => "↑",
+        ScrollDirection::Down => "↓",
+    }
+}
+
+fn fmt_duration(duration: Duration) -> String {
+    format!("{:.3}ms", duration.as_secs_f64() * 1000.0)
+}
+
+fn fmt_duration_opt(duration: Option<Duration>) -> String {
+    duration
+        .map(fmt_duration)
+        .unwrap_or_else(|| "--".to_string())
+}
+
+fn average_duration(total: Duration, samples: u32) -> Option<Duration> {
+    if samples == 0 {
+        return None;
+    }
+
+    let avg_us = total.as_micros() / samples as u128;
+    Some(Duration::from_micros(avg_us as u64))
+}
+
+fn median(values: &mut [u128]) -> u128 {
+    values.sort_unstable();
+    let mid = values.len() / 2;
+    if values.len() % 2 == 1 {
+        values[mid]
+    } else {
+        (values[mid - 1] + values[mid]) / 2
     }
 }
