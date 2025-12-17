@@ -21,6 +21,8 @@
 - Auto timeout uses median + 3 * MAD from recent inter-event gaps.
 - Manual timeout defaults to 120ms and adjusts in 10ms steps.
 - Content source cycles between lipsum, design doc, and source code.
+- Burst classification provides a wheel/trackpad guess for active and last bursts.
+- Stats include environment variables, multiplexer state, and a terminal guess.
 
 ## Controls
 
@@ -36,11 +38,12 @@
 ## Debug Pane Layout
 
 - Help block at the top.
-- Blank spacer line.
-- Labeled stats block (Active, Last, Gap, Cal, Source, Timeout).
-- Horizontal border.
-- Explanation block (legend for `Δt`, `t`, Active/Last, Burst).
-- Event log entries after the legend.
+- Separator line.
+- Stats title and labeled stats block (Active, Last, Gap, Input, Cal, Source, Env, Mux, Guess, Timeout).
+- Separator line.
+- Legend title and explanation block (`Δt`, `t`, Active/Last, Burst).
+- Separator line.
+- Events title and log entries.
 
 ## Plan
 
@@ -108,6 +111,29 @@ The debug pane uses a fixed-width label column so values line up vertically even
 numeric values grow. Labels are left-aligned and data is padded so the rows read like
 a table. Duration values always render with the same precision (`ms` with three
 decimals) to avoid jitter when counts change.
+
+## Input Guess Heuristic
+
+The "Input" line is a rough classification of the scroll source:
+
+- Wheel: short bursts with tight gaps (avg gap <= 5ms, count 4-20, duration <= 150ms).
+- Trackpad: longer gaps or longer bursts (avg gap >= 20ms, duration >= 300ms, or count >= 20).
+- Unknown: everything in between.
+
+This is intentionally conservative and meant as a hint; the raw metrics remain visible
+so you can tune thresholds for specific terminals.
+
+## Environment Section
+
+The environment block lists any of the known terminal-related variables that are set
+(`TERM`, `TERM_PROGRAM`, `TERM_PROGRAM_VERSION`, `TERMINAL_EMULATOR`, `COLORTERM`,
+`TMUX`, `TMUX_TERM`, `ZELLIJ`, `ZELLIJ_SESSION_NAME`). This shows the raw source
+values instead of a derived yes/no so you can compare real terminal setups.
+
+The "Mux" line reports which multiplexer is active (`none`, `tmux`, `zellij`) based on
+the presence of `TMUX` or `ZELLIJ`. The "Guess" line is a best-effort terminal name
+derived from those same environment variables (for example, `Terminal.app`, `iTerm2`,
+`Ghostty`, `kitty`, `Alacritty`, `WezTerm`). Treat this as a hint, not a ground truth.
 
 ## Median + MAD Timeout
 

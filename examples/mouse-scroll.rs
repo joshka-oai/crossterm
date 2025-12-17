@@ -37,14 +37,21 @@ const LIPSUM: &str = include_str!("mouse-scroll-lipsum.txt");
 const SOURCE_CODE: &str = include_str!("mouse-scroll.rs");
 const DESIGN_DOC: &str = include_str!("mouse-scroll-plan.md");
 const CONTENT_MIN_WIDTH: usize = 20;
-const LOG_MIN_WIDTH: usize = 24;
-const LOG_MAX_WIDTH: usize = 40;
+const LOG_MIN_WIDTH: usize = 26;
+const LOG_MAX_WIDTH: usize = 46;
 const LOG_GAP: usize = 1;
 const MAX_LOG_EVENTS: usize = 200;
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const DEFAULT_BURST_TIMEOUT: Duration = Duration::from_millis(120);
 const TIMEOUT_STEP: Duration = Duration::from_millis(10);
 const GAP_SAMPLE_LIMIT: usize = 80;
+const WHEEL_GAP_MAX: Duration = Duration::from_millis(5);
+const WHEEL_MAX_DURATION: Duration = Duration::from_millis(150);
+const WHEEL_MIN_COUNT: u32 = 4;
+const WHEEL_MAX_COUNT: u32 = 20;
+const TRACKPAD_GAP_MIN: Duration = Duration::from_millis(20);
+const TRACKPAD_MIN_DURATION: Duration = Duration::from_millis(300);
+const TRACKPAD_MIN_COUNT: u32 = 20;
 const HELP_LINES: [&str; 8] = [
     "  q/Esc  quit",
     "  1/3    step",
@@ -55,12 +62,13 @@ const HELP_LINES: [&str; 8] = [
     "  r      reset",
     "  arrows scroll",
 ];
-const EXPLAIN_LINES: [&str; 6] = [
+const EXPLAIN_LINES: [&str; 7] = [
     "  Δt   gap from previous event",
     "  t    time since burst start",
     "  Active   current burst stats",
     "  Last     last closed burst",
     "  Gap      time between bursts",
+    "  Input    wheel/trackpad guess",
     "  Burst    summary at close",
 ];
 const LABEL_WIDTH: usize = 9;
@@ -109,6 +117,7 @@ struct App {
     next_burst_color: Color,
     width: u16,
     height: u16,
+    terminal_info: TerminalInfo,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -141,6 +150,13 @@ enum ScrollDirection {
     Down,
 }
 
+#[derive(Copy, Clone, Debug)]
+enum InputGuess {
+    Wheel,
+    Trackpad,
+    Unknown,
+}
+
 #[derive(Clone, Debug)]
 struct LogEntry {
     text: String,
@@ -154,6 +170,7 @@ struct BurstState {
     count: u32,
     direction: ScrollDirection,
     sum_delta: Duration,
+    gap_from_prev: Option<Duration>,
     color: Color,
 }
 
@@ -163,12 +180,34 @@ struct BurstSummary {
     count: u32,
     duration: Duration,
     avg_delta: Option<Duration>,
+    gap_from_prev: Option<Duration>,
 }
 
 #[derive(Copy, Clone, Debug)]
 enum TimeoutMode {
     Auto,
     Manual,
+}
+
+#[derive(Copy, Clone, Debug)]
+enum Multiplexer {
+    None,
+    Tmux,
+    Zellij,
+}
+
+#[derive(Clone, Debug)]
+struct TerminalInfo {
+    term: Option<String>,
+    term_program: Option<String>,
+    term_program_version: Option<String>,
+    term_emulator: Option<String>,
+    colorterm: Option<String>,
+    tmux: Option<String>,
+    tmux_term: Option<String>,
+    zellij: Option<String>,
+    zellij_session: Option<String>,
+    multiplexer: Multiplexer,
 }
 
 impl App {
@@ -204,6 +243,7 @@ impl App {
             next_burst_color: Color::Blue,
             width,
             height,
+            terminal_info: TerminalInfo::detect(),
         })
     }
 
@@ -678,6 +718,12 @@ impl App {
         }
 
         lines.push(format!(
+            "{}A:{} L:{}",
+            pad_label("Input"),
+            self.active_input_guess(now),
+            self.last_input_guess()
+        ));
+        lines.push(format!(
             "{}{}",
             pad_label("Cal"),
             self.calibration_label()
@@ -687,8 +733,53 @@ impl App {
             pad_label("Source"),
             self.content_source_label()
         ));
+        let env_vars = self.terminal_info.env_kv();
+        if env_vars.is_empty() {
+            lines.push(format!("{}--", pad_label("Env")));
+        } else {
+            for (index, (key, value)) in env_vars.into_iter().enumerate() {
+                let label = if index == 0 { "Env" } else { "" };
+                lines.push(format!("{}{}={}", pad_label(label), key, value));
+            }
+        }
+        lines.push(format!(
+            "{}{}",
+            pad_label("Mux"),
+            self.terminal_info.mux_label()
+        ));
+        lines.push(format!(
+            "{}{}",
+            pad_label("Guess"),
+            self.terminal_info.guess_label()
+        ));
         lines.extend(self.timeout_lines());
         lines
+    }
+
+    /// Summarize the active burst as a coarse input guess.
+    ///
+    /// This returns `--` when no burst is active.
+    fn active_input_guess(&self, now: Instant) -> &'static str {
+        let Some(burst) = &self.burst else {
+            return "--";
+        };
+        let duration = now.duration_since(burst.start);
+        let avg_delta = average_duration(burst.sum_delta, burst.count.saturating_sub(1));
+        input_guess_label(guess_input_kind(burst.count, duration, avg_delta))
+    }
+
+    /// Summarize the most recent completed burst as a coarse input guess.
+    ///
+    /// This returns `--` until at least one burst has completed.
+    fn last_input_guess(&self) -> &'static str {
+        let Some(summary) = &self.last_burst else {
+            return "--";
+        };
+        input_guess_label(guess_input_kind(
+            summary.count,
+            summary.duration,
+            summary.avg_delta,
+        ))
     }
 
     /// Record a non-scroll mouse event in the log.
@@ -697,7 +788,7 @@ impl App {
             return;
         }
         let text = format!(
-            "{:?} ({}, {}) {:?}",
+            "  {:?} ({}, {}) {:?}",
             mouse.kind, mouse.column, mouse.row, mouse.modifiers
         );
         self.push_log(text, None);
@@ -713,7 +804,7 @@ impl App {
         color: Color,
     ) {
         let text = format!(
-            "{} Δ{} t={} ({}, {}) {:?}",
+            "  {} Δ{} t={} ({}, {}) {:?}",
             direction_label(direction),
             fmt_duration(delta),
             fmt_duration(elapsed),
@@ -744,15 +835,17 @@ impl App {
     /// Start a new burst for the given direction.
     fn start_burst(&mut self, direction: ScrollDirection, now: Instant) {
         let color = self.next_burst_color();
-        self.last_burst_gap = self
+        let gap_from_prev = self
             .last_burst_end
             .map(|end| now.saturating_duration_since(end));
+        self.last_burst_gap = gap_from_prev;
         self.burst = Some(BurstState {
             start: now,
             last: now,
             count: 0,
             direction,
             sum_delta: Duration::from_millis(0),
+            gap_from_prev,
             color,
         });
     }
@@ -770,6 +863,7 @@ impl App {
             count: burst.count,
             duration,
             avg_delta,
+            gap_from_prev: burst.gap_from_prev,
         };
         self.last_burst = Some(summary.clone());
         self.last_burst_end = Some(burst.last);
@@ -780,12 +874,17 @@ impl App {
 
     /// Record a burst summary line in the log.
     fn log_burst_summary(&mut self, summary: &BurstSummary, color: Color) {
+        let gap = summary
+            .gap_from_prev
+            .map(fmt_duration)
+            .unwrap_or_else(|| "--".to_string());
         let text = format!(
-            "Burst {} {} ev {} avgΔ {}",
+            "Burst {} {} ev {} avgΔ {} gap {}",
             direction_label(summary.direction),
             summary.count,
             fmt_duration(summary.duration),
-            fmt_duration_opt(summary.avg_delta)
+            fmt_duration_opt(summary.avg_delta),
+            gap
         );
         self.push_log(text, Some(color));
     }
@@ -1024,6 +1123,135 @@ impl App {
     }
 }
 
+impl TerminalInfo {
+    fn detect() -> Self {
+        let term = std::env::var("TERM").ok();
+        let term_program = std::env::var("TERM_PROGRAM").ok();
+        let term_program_version = std::env::var("TERM_PROGRAM_VERSION").ok();
+        let term_emulator = std::env::var("TERMINAL_EMULATOR").ok();
+        let colorterm = std::env::var("COLORTERM").ok();
+        let tmux = std::env::var("TMUX").ok();
+        let tmux_term = std::env::var("TMUX_TERM").ok();
+        let zellij = std::env::var("ZELLIJ").ok();
+        let zellij_session = std::env::var("ZELLIJ_SESSION_NAME").ok();
+        let multiplexer = Self::multiplexer_from_env(&tmux, &zellij);
+
+        Self {
+            term,
+            term_program,
+            term_program_version,
+            term_emulator,
+            colorterm,
+            tmux,
+            tmux_term,
+            zellij,
+            zellij_session,
+            multiplexer,
+        }
+    }
+
+    fn mux_label(&self) -> &'static str {
+        match self.multiplexer {
+            Multiplexer::None => "none",
+            Multiplexer::Tmux => "tmux",
+            Multiplexer::Zellij => "zellij",
+        }
+    }
+
+    fn env_kv(&self) -> Vec<(&'static str, String)> {
+        let mut vars = Vec::new();
+        if let Some(value) = &self.term {
+            vars.push(("TERM", value.clone()));
+        }
+        if let Some(value) = &self.term_program {
+            vars.push(("TERM_PROGRAM", value.clone()));
+        }
+        if let Some(value) = &self.term_program_version {
+            vars.push(("TERM_PROGRAM_VERSION", value.clone()));
+        }
+        if let Some(value) = &self.term_emulator {
+            vars.push(("TERMINAL_EMULATOR", value.clone()));
+        }
+        if let Some(value) = &self.colorterm {
+            vars.push(("COLORTERM", value.clone()));
+        }
+        if let Some(value) = &self.tmux {
+            vars.push(("TMUX", value.clone()));
+        }
+        if let Some(value) = &self.tmux_term {
+            vars.push(("TMUX_TERM", value.clone()));
+        }
+        if let Some(value) = &self.zellij {
+            vars.push(("ZELLIJ", value.clone()));
+        }
+        if let Some(value) = &self.zellij_session {
+            vars.push(("ZELLIJ_SESSION_NAME", value.clone()));
+        }
+        vars
+    }
+
+    fn guess_label(&self) -> String {
+        self.guess_terminal()
+            .unwrap_or_else(|| "--".to_string())
+    }
+
+    fn guess_terminal(&self) -> Option<String> {
+        if let Some(program) = &self.term_program {
+            match program.as_str() {
+                "Apple_Terminal" => return Some("Terminal.app".to_string()),
+                "iTerm.app" => return Some("iTerm2".to_string()),
+                _ => {
+                    let program_lower = program.to_ascii_lowercase();
+                    if program_lower.contains("wezterm") {
+                        return Some("WezTerm".to_string());
+                    }
+                    if program_lower.contains("ghostty") {
+                        return Some("Ghostty".to_string());
+                    }
+                }
+            }
+        }
+
+        if let Some(emulator) = &self.term_emulator {
+            let emulator_lower = emulator.to_ascii_lowercase();
+            if emulator_lower.contains("ghostty") {
+                return Some("Ghostty".to_string());
+            }
+            if emulator_lower.contains("wezterm") {
+                return Some("WezTerm".to_string());
+            }
+        }
+
+        if let Some(term) = &self.term {
+            let term_lower = term.to_ascii_lowercase();
+            if term_lower.contains("xterm-kitty") || term_lower.contains("kitty") {
+                return Some("kitty".to_string());
+            }
+            if term_lower.contains("alacritty") {
+                return Some("Alacritty".to_string());
+            }
+            if term_lower.contains("wezterm") {
+                return Some("WezTerm".to_string());
+            }
+            if term_lower.contains("ghostty") {
+                return Some("Ghostty".to_string());
+            }
+        }
+
+        None
+    }
+
+    fn multiplexer_from_env(tmux: &Option<String>, zellij: &Option<String>) -> Multiplexer {
+        if zellij.is_some() {
+            Multiplexer::Zellij
+        } else if tmux.is_some() {
+            Multiplexer::Tmux
+        } else {
+            Multiplexer::None
+        }
+    }
+}
+
 fn direction_label(direction: ScrollDirection) -> &'static str {
     match direction {
         ScrollDirection::Up => "↑",
@@ -1056,6 +1284,37 @@ fn average_duration(total: Duration, samples: u32) -> Option<Duration> {
 
     let avg_us = total.as_micros() / samples as u128;
     Some(Duration::from_micros(avg_us as u64))
+}
+
+fn guess_input_kind(count: u32, duration: Duration, avg_delta: Option<Duration>) -> InputGuess {
+    let Some(avg_delta) = avg_delta else {
+        return InputGuess::Unknown;
+    };
+
+    let is_wheel = avg_delta <= WHEEL_GAP_MAX
+        && count >= WHEEL_MIN_COUNT
+        && count <= WHEEL_MAX_COUNT
+        && duration <= WHEEL_MAX_DURATION;
+    if is_wheel {
+        return InputGuess::Wheel;
+    }
+
+    let is_trackpad = avg_delta >= TRACKPAD_GAP_MIN
+        || duration >= TRACKPAD_MIN_DURATION
+        || count >= TRACKPAD_MIN_COUNT;
+    if is_trackpad {
+        return InputGuess::Trackpad;
+    }
+
+    InputGuess::Unknown
+}
+
+fn input_guess_label(guess: InputGuess) -> &'static str {
+    match guess {
+        InputGuess::Wheel => "wheel",
+        InputGuess::Trackpad => "trackpad",
+        InputGuess::Unknown => "unknown",
+    }
 }
 
 fn median(values: &mut [u128]) -> u128 {
