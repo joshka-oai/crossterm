@@ -6,8 +6,8 @@
 //! than polished UI, so the behavior stays close to the raw event stream.
 //!
 //! Keys: `q`/`Esc` quits, `1`/`3` change scroll step, `a` toggles auto/manual timeout,
-//! `[`/`]` adjust manual timeout, `t` toggles content (lipsum/design), `d` toggles the
-//! debug pane, `r` resets counters and calibration, arrows scroll line-by-line.
+//! `[`/`]` adjust manual timeout, `t` toggles content (lipsum/design/source), `d` toggles
+//! the debug pane, `r` resets counters and calibration, arrows scroll line-by-line.
 //!
 //! cargo run --example mouse-scroll
 
@@ -22,7 +22,9 @@ use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyModifiers,
     MouseEvent, MouseEventKind,
 };
-use crossterm::style::{Attribute, Color, Print, SetAttribute, SetForegroundColor};
+use crossterm::style::{
+    Attribute, Color, Print, SetAttribute, SetBackgroundColor, SetForegroundColor,
+};
 use crossterm::terminal::{
     self, disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen,
     LeaveAlternateScreen,
@@ -32,6 +34,7 @@ use textwrap::wrap;
 use tokio::time::{interval, MissedTickBehavior};
 
 const LIPSUM: &str = include_str!("mouse-scroll-lipsum.txt");
+const SOURCE_CODE: &str = include_str!("mouse-scroll.rs");
 const DESIGN_DOC: &str = include_str!("mouse-scroll-plan.md");
 const CONTENT_MIN_WIDTH: usize = 20;
 const LOG_MIN_WIDTH: usize = 24;
@@ -43,7 +46,6 @@ const DEFAULT_BURST_TIMEOUT: Duration = Duration::from_millis(120);
 const TIMEOUT_STEP: Duration = Duration::from_millis(10);
 const GAP_SAMPLE_LIMIT: usize = 80;
 const HELP_LINES: [&str; 8] = [
-    "Keys:",
     "  q/Esc  quit",
     "  1/3    step",
     "  a      auto timeout",
@@ -51,14 +53,17 @@ const HELP_LINES: [&str; 8] = [
     "  t      content",
     "  d      debug",
     "  r      reset",
+    "  arrows scroll",
 ];
-const EXPLAIN_LINES: [&str; 5] = [
-    "Stats:",
-    "  Δt = gap from previous event",
-    "  t  = time since burst start",
-    "  Active/Last = current/closed burst",
-    "  Burst = summary line when closed",
+const EXPLAIN_LINES: [&str; 6] = [
+    "  Δt   gap from previous event",
+    "  t    time since burst start",
+    "  Active   current burst stats",
+    "  Last     last closed burst",
+    "  Gap      time between bursts",
+    "  Burst    summary at close",
 ];
+const LABEL_WIDTH: usize = 9;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -127,6 +132,7 @@ enum ScrollStep {
 enum ContentSource {
     Lipsum,
     DesignDoc,
+    SourceCode,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -438,11 +444,13 @@ impl App {
     fn toggle_content_source(&mut self) {
         self.content_source = match self.content_source {
             ContentSource::Lipsum => ContentSource::DesignDoc,
-            ContentSource::DesignDoc => ContentSource::Lipsum,
+            ContentSource::DesignDoc => ContentSource::SourceCode,
+            ContentSource::SourceCode => ContentSource::Lipsum,
         };
         self.text = match self.content_source {
             ContentSource::Lipsum => LIPSUM,
             ContentSource::DesignDoc => DESIGN_DOC,
+            ContentSource::SourceCode => SOURCE_CODE,
         };
         self.rewrap();
     }
@@ -544,7 +552,11 @@ impl App {
         }
 
         let mut row = 0;
-        for line in HELP_LINES.iter().take(view_height) {
+        if row < view_height {
+            render_title(stdout, log_x, row as u16, layout.log_width, "Keys")?;
+            row += 1;
+        }
+        for line in HELP_LINES.iter().take(view_height.saturating_sub(row)) {
             let mut help = line.to_string();
             help.truncate(layout.log_width);
             queue!(stdout, MoveTo(log_x, row as u16), Print(help))?;
@@ -552,10 +564,16 @@ impl App {
         }
 
         if row < view_height {
+            render_separator(stdout, separator_x, row as u16, layout.log_width)?;
             row += 1;
         }
 
         let now = Instant::now();
+        if row < view_height {
+            render_title(stdout, log_x, row as u16, layout.log_width, "Stats")?;
+            row += 1;
+        }
+
         for line in self
             .debug_lines(now)
             .into_iter()
@@ -568,18 +586,36 @@ impl App {
         }
 
         if row < view_height {
-            let border_width = layout.log_width + LOG_GAP;
-            queue!(
-                stdout,
-                MoveTo(separator_x, row as u16),
-                Print("├"),
-                Print("─".repeat(border_width))
-            )?;
+            render_separator(stdout, separator_x, row as u16, layout.log_width)?;
             row += 1;
         }
 
+        if row < view_height {
+            render_title(stdout, log_x, row as u16, layout.log_width, "Legend")?;
+            row += 1;
+        }
         let explain_rows = EXPLAIN_LINES.len().min(view_height.saturating_sub(row));
-        let log_rows = view_height.saturating_sub(row + explain_rows);
+        for (offset, line) in EXPLAIN_LINES.iter().take(explain_rows).enumerate() {
+            let mut text = line.to_string();
+            text.truncate(layout.log_width);
+            queue!(
+                stdout,
+                MoveTo(log_x, (row + offset) as u16),
+                Print(text)
+            )?;
+        }
+        row += explain_rows;
+
+        if row < view_height {
+            render_separator(stdout, separator_x, row as u16, layout.log_width)?;
+            row += 1;
+        }
+
+        if row < view_height {
+            render_title(stdout, log_x, row as u16, layout.log_width, "Events")?;
+            row += 1;
+        }
+        let log_rows = view_height.saturating_sub(row);
         for (offset, entry) in self.mouse_log.iter().take(log_rows).enumerate() {
             let mut line = entry.text.clone();
             line.truncate(layout.log_width);
@@ -594,17 +630,6 @@ impl App {
             queue!(stdout, Print(line), SetAttribute(Attribute::Reset))?;
         }
 
-        let explain_start = row + log_rows;
-        for (offset, line) in EXPLAIN_LINES.iter().take(explain_rows).enumerate() {
-            let mut text = line.to_string();
-            text.truncate(layout.log_width);
-            queue!(
-                stdout,
-                MoveTo(log_x, (explain_start + offset) as u16),
-                Print(text)
-            )?;
-        }
-
         Ok(())
     }
 
@@ -613,41 +638,55 @@ impl App {
     /// The header is split across multiple lines to keep the log pane readable.
     fn debug_lines(&self, now: Instant) -> Vec<String> {
         let mut lines = Vec::new();
-        lines.push(format!("Mouse events ({})", self.mouse_log.len()));
+        lines.push(format!(
+            "{}{}",
+            pad_label("Mouse events"),
+            format!("{:>4}", self.mouse_log.len())
+        ));
         if let Some(burst) = &self.burst {
             let elapsed = now.duration_since(burst.start);
             let avg_delta = average_duration(burst.sum_delta, burst.count.saturating_sub(1));
             lines.push(format!(
-                "Active {} {} ev {} avgΔ {}",
+                "{}{} {} ev {} avgΔ {}",
+                pad_label("Active"),
                 direction_label(burst.direction),
-                burst.count,
+                fmt_count(burst.count),
                 fmt_duration(elapsed),
                 fmt_duration_opt(avg_delta)
             ));
         } else {
-            lines.push("Active --".to_string());
+            lines.push(format!("{}--", pad_label("Active")));
         }
 
         if let Some(last) = &self.last_burst {
             lines.push(format!(
-                "Last {} {} ev {} avgΔ {}",
+                "{}{} {} ev {} avgΔ {}",
+                pad_label("Last"),
                 direction_label(last.direction),
-                last.count,
+                fmt_count(last.count),
                 fmt_duration(last.duration),
                 fmt_duration_opt(last.avg_delta)
             ));
         } else {
-            lines.push("Last --".to_string());
+            lines.push(format!("{}--", pad_label("Last")));
         }
 
         if let Some(gap) = self.last_burst_gap {
-            lines.push(format!("Gap {}", fmt_duration(gap)));
+            lines.push(format!("{}{}", pad_label("Gap"), fmt_duration(gap)));
         } else {
-            lines.push("Gap --".to_string());
+            lines.push(format!("{}--", pad_label("Gap")));
         }
 
-        lines.push(format!("Cal {}", self.calibration_label()));
-        lines.push(format!("Source {}", self.content_source_label()));
+        lines.push(format!(
+            "{}{}",
+            pad_label("Cal"),
+            self.calibration_label()
+        ));
+        lines.push(format!(
+            "{}{}",
+            pad_label("Source"),
+            self.content_source_label()
+        ));
         lines.extend(self.timeout_lines());
         lines
     }
@@ -870,20 +909,31 @@ impl App {
     fn timeout_lines(&self) -> Vec<String> {
         match self.timeout_mode {
             TimeoutMode::Manual => vec![
-                "Timeout manual".to_string(),
-                format!("  {}", fmt_duration(self.manual_timeout)),
+                format!("{}manual", pad_label("Timeout")),
+                format!("{}{}", pad_label(""), fmt_duration(self.manual_timeout)),
+                format!("{}--", pad_label("")),
             ],
             TimeoutMode::Auto => {
                 if let Some((median, mad, timeout)) = self.auto_timeout_stats() {
                     vec![
-                        "Timeout auto".to_string(),
-                        format!("  {}", fmt_duration(timeout)),
-                        format!("  med {} mad {}", fmt_duration(median), fmt_duration(mad)),
+                        format!("{}auto", pad_label("Timeout")),
+                        format!("{}{}", pad_label(""), fmt_duration(timeout)),
+                        format!(
+                            "{}med {} mad {}",
+                            pad_label(""),
+                            fmt_duration(median),
+                            fmt_duration(mad)
+                        ),
                     ]
                 } else {
                     vec![
-                        "Timeout auto".to_string(),
-                        format!("  {} (no data)", fmt_duration(self.manual_timeout)),
+                        format!("{}auto", pad_label("Timeout")),
+                        format!(
+                            "{}{} (no data)",
+                            pad_label(""),
+                            fmt_duration(self.manual_timeout)
+                        ),
+                        format!("{}med -- mad --", pad_label("")),
                     ]
                 }
             }
@@ -911,6 +961,7 @@ impl App {
         match self.content_source {
             ContentSource::Lipsum => "lipsum",
             ContentSource::DesignDoc => "design",
+            ContentSource::SourceCode => "source",
         }
     }
 
@@ -990,6 +1041,14 @@ fn fmt_duration_opt(duration: Option<Duration>) -> String {
         .unwrap_or_else(|| "--".to_string())
 }
 
+fn pad_label(label: &str) -> String {
+    format!("{label:<LABEL_WIDTH$} ", label = label, LABEL_WIDTH = LABEL_WIDTH)
+}
+
+fn fmt_count(count: u32) -> String {
+    format!("{count:>4}")
+}
+
 fn average_duration(total: Duration, samples: u32) -> Option<Duration> {
     if samples == 0 {
         return None;
@@ -1007,4 +1066,61 @@ fn median(values: &mut [u128]) -> u128 {
     } else {
         (values[mid - 1] + values[mid]) / 2
     }
+}
+
+fn render_separator(
+    stdout: &mut io::Stdout,
+    separator_x: u16,
+    row: u16,
+    log_width: usize,
+) -> io::Result<()> {
+    let border_width = log_width + LOG_GAP;
+    let dash_count = border_width.saturating_sub(1);
+    queue!(
+        stdout,
+        MoveTo(separator_x, row),
+        Print("├"),
+        Print("─".repeat(dash_count))
+    )?;
+    Ok(())
+}
+
+fn render_title(
+    stdout: &mut io::Stdout,
+    log_x: u16,
+    row: u16,
+    log_width: usize,
+    title: &str,
+) -> io::Result<()> {
+    let line = center_text(title, log_width);
+    queue!(
+        stdout,
+        MoveTo(log_x, row),
+        SetBackgroundColor(Color::DarkGrey),
+        SetForegroundColor(Color::White),
+        Print(line),
+        SetAttribute(Attribute::Reset)
+    )?;
+    Ok(())
+}
+
+fn center_text(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+
+    let padded = format!(" {text} ");
+    let trimmed: String = padded.chars().take(width).collect();
+    let text_len = trimmed.chars().count();
+    if text_len >= width {
+        return trimmed;
+    }
+
+    let left = (width - text_len) / 2;
+    let right = width - text_len - left;
+    let mut out = String::with_capacity(width);
+    out.push_str(&" ".repeat(left));
+    out.push_str(&trimmed);
+    out.push_str(&" ".repeat(right));
+    out
 }

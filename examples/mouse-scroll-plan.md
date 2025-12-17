@@ -8,6 +8,40 @@
 - Show rich per-event and per-burst timing details in the debug pane.
 - Support auto vs manual burst timeout with live feedback.
 
+## Current Behavior
+
+- Event loop uses tokio + `EventStream` with a 60fps interval.
+- Rendering runs only when needed, plus while a burst is active.
+- Rendering uses the alternate screen and synchronized updates.
+- Scrolls line-by-line with a selectable step (1 or 3).
+- Burst boundaries happen on timeout or direction change.
+- Per-event log lines show direction, delta (`Δt`), elapsed (`t`), and coordinates.
+- Burst summaries are logged when a burst closes (count, duration, avg delta).
+- Burst log entries alternate blue/cyan to group bursts visually.
+- Auto timeout uses median + 3 * MAD from recent inter-event gaps.
+- Manual timeout defaults to 120ms and adjusts in 10ms steps.
+- Content source cycles between lipsum, design doc, and source code.
+
+## Controls
+
+- `q`/`Esc`: quit
+- `1`/`3`: scroll step
+- `a`: auto/manual timeout
+- `[`/`]`: manual timeout -/+
+- `t`: content source (lipsum/design/source)
+- `d`: debug pane on/off
+- `r`: reset counters and burst state
+- arrows: scroll line-by-line
+
+## Debug Pane Layout
+
+- Help block at the top.
+- Blank spacer line.
+- Labeled stats block (Active, Last, Gap, Cal, Source, Timeout).
+- Horizontal border.
+- Explanation block (legend for `Δt`, `t`, Active/Last, Burst).
+- Event log entries after the legend.
+
 ## Plan
 
 ### 1. Burst timing model + state
@@ -67,3 +101,21 @@
 - Exact auto-timeout formula: median + MAD chosen for robustness.
   - Not chosen: mean + k * stdev (more sensitive to spikes).
 - Whether to cap events per frame: not needed since rendering is decoupled.
+
+## Debug Pane Alignment
+
+The debug pane uses a fixed-width label column so values line up vertically even as
+numeric values grow. Labels are left-aligned and data is padded so the rows read like
+a table. Duration values always render with the same precision (`ms` with three
+decimals) to avoid jitter when counts change.
+
+## Median + MAD Timeout
+
+Auto timeout uses the median inter-event gap as the typical spacing between scroll
+events. The median is robust to occasional spikes that would skew a mean.
+
+MAD (median absolute deviation) is the median of the absolute differences from that
+median gap. It captures the typical variability without being thrown off by outliers.
+
+The effective timeout is computed as `median + 3 * MAD`, which tolerates jitter while
+still closing bursts once the gap meaningfully exceeds normal behavior.
