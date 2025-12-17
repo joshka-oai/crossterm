@@ -14,6 +14,7 @@ use crossterm::terminal::{
     LeaveAlternateScreen,
 };
 use crossterm::{execute, queue};
+use textwrap::{wrap, Options};
 
 const LIPSUM: &str = include_str!("mouse-scroll-lipsum.txt");
 
@@ -137,28 +138,21 @@ impl App {
 fn wrap_paragraphs(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut lines = Vec::new();
+    let options = Options::new(width).break_words(false);
 
-    for paragraph in text.split("\n\n") {
-        let mut line = String::new();
-        for word in paragraph.split_whitespace() {
-            if line.is_empty() {
-                line.push_str(word);
-            } else if line.len() + 1 + word.len() <= width {
-                line.push(' ');
-                line.push_str(word);
-            } else {
-                lines.push(line);
-                line = word.to_string();
+    let paragraphs: Vec<&str> = text.split("\n\n").collect();
+    for (index, paragraph) in paragraphs.iter().enumerate() {
+        if paragraph.trim().is_empty() {
+            lines.push(String::new());
+        } else {
+            for line in wrap(paragraph, &options) {
+                lines.push(line.into_owned());
             }
         }
-        if !line.is_empty() {
-            lines.push(line);
-        }
-        lines.push(String::new());
-    }
 
-    if lines.last().map_or(false, |line| line.is_empty()) {
-        lines.pop();
+        if index + 1 < paragraphs.len() {
+            lines.push(String::new());
+        }
     }
 
     if lines.is_empty() {
